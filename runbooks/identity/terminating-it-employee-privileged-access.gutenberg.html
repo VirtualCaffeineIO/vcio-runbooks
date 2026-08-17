@@ -1,0 +1,462 @@
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:paragraph -->
+<p style="font-size:1.6em">An IT employee with privileged access is leaving, and you have one pass to get this right. By the end of this run book their identity is disabled and tokenless, their devices are blocked and reclaimed, their mailbox is a shared mailbox the team can read, and every credential they knew that was never theirs has been rotated. The order matters more than the speed.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Offboarding an ordinary user is a checklist, and most of it survives being done sloppily. Offboarding the person who ran the checklist is a different exercise, because their access does not end at their account. They know passwords that were never theirs. They own automation that will keep running after they leave. They can name every gap in your controls, because they built the controls. And they almost certainly have more than one account, because the daily-driver mailbox account and the privileged account are supposed to be separate. This run book is written for that person: the sysadmin, the infrastructure engineer, the one of two people in the IT department.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>It works for the friendly resignation with two weeks of notice and for the termination that ends with a 2 pm walkout. The difference between those two is compression, never order. Everything here assumes a Microsoft-centric estate: Entra ID, Intune, Exchange Online, with or without on-prem Active Directory. Where the run book says "the account," read it as "each of their accounts," and read the section on the second account before you start, because that distinction is the one most likely to bite you. Each step opens with its checklist, the items and nothing else, so you can run the whole termination from the boxes alone. Under each checklist sits the walk-through, admin centers named, for any line where you need the detail, and where a section has several portal moves, a single consolidated PowerShell block reproduces them for the reader who scripts the cut. The last third of the run book deliberately leaves the tenant, because the departing admin's access does too.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p><strong>Prerequisites.</strong> A second privileged person who is not the leaver, holding: <code>Privileged Authentication Administrator</code> or Global Administrator in Entra (disabling an admin account requires Privileged Authentication Administrator; User Administrator is only enough for non-admin accounts), at least <code>Cloud Device Administrator</code> for device disable, an Intune role carrying the Retire and Wipe remote tasks, Exchange Administrator, and Domain Admin equivalent on-prem if you are hybrid. A working break-glass account you can prove is not known to the leaver. If you want the consolidated blocks, Microsoft Graph PowerShell and the Exchange Online module installed somewhere that is not the leaver's machine.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">Step 1: Build the dossier before the conversation happens</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>The identity cut happens during the termination conversation, and that is only possible if the inventory work happened before it. Quietly, before the meeting, enumerate what this person holds. You are answering five questions: how many accounts do they have, what roles do those accounts hold, what devices are theirs, what objects do they own, and what credentials do they know that are not attached to any account of theirs. The first four come out of the portals. The fourth is a judgment call you make honestly, and the honest answer for a long-tenured admin is usually "assume all of them."</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul class="wp-block-list">
+<li>☐ Second privileged person confirmed, with the roles from the prerequisites line</li>
+<li>☐ Break-glass account works and is unknown to the leaver</li>
+<li>☐ Every account they hold found, not just the mailbox one (admin accounts, cloud-only accounts, on-prem-only accounts, test accounts they made)</li>
+<li>☐ Roles inventoried, active and eligible, per account</li>
+<li>☐ Devices inventoried</li>
+<li>☐ Owned groups, Teams, and app registrations inventoried</li>
+<li>☐ Mailbox size noted (under 50 GB means the license comes back)</li>
+<li>☐ Mailbox path decided: shared, or hold and inactive</li>
+<li>☐ Disposition decided per device: returning or remote wipe</li>
+<li>☐ Dossier started and dated</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p><strong>The walk-through.</strong></p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list {"ordered":true} -->
+<ol class="wp-block-list">
+<li><strong>Find every account first, then run the rest of this list once per account.</strong> In the Microsoft Entra admin center, open <strong>Entra ID</strong>, <strong>Users</strong>, and search on the person's surname rather than their UPN, so you catch the naming variants. Then search again for your admin-account convention, whatever it is locally: <code>adm-</code>, <code>a-</code>, <code>.admin</code>, <code>-adm</code>. Add the <strong>On-premises sync enabled</strong> and <strong>Company name</strong> columns to the results view, because they separate the synced daily-driver account from the cloud-only admin account at a glance. The section after this walk-through says why this is the step people skip.</li>
+<li>Select the user. The <strong>Assigned roles</strong> page lists their directory roles. In a PIM tenant it shows both <strong>Eligible assignments</strong> and <strong>Active assignments</strong>; record both, because an eligible Global Administrator does not show up as an active role anywhere else.</li>
+<li>Cross-check in PIM: <strong>ID Governance</strong>, <strong>Privileged Identity Management</strong>, <strong>Microsoft Entra roles</strong>, then <strong>Assignments</strong>, filtered to the user. This is the surface you will remove them from later, so note what you see now.</li>
+<li>Still on the user, open <strong>Devices</strong> and record every registered and joined device, with its join type and whether it is Intune-managed.</li>
+<li>Open the user's <strong>Groups</strong> page and switch to the <strong>Ownership</strong> tab. Groups they own need a new owner before the account is disabled, or they orphan.</li>
+<li>App registrations have no owner filter in the portal, so ownership enumeration is one of this run book's honest Graph-only moves: <code>Get-MgUserOwnedObject</code> in the block below returns every group and app registration they own in one list. Record the app registrations specifically; step 5 rotates their secrets.</li>
+<li>In the Microsoft 365 admin center, open <strong>Users</strong>, <strong>Active users</strong>, select the user, and note the mailbox size on the <strong>Mail</strong> tab. Under 50 GB matters for the license decision in step 4.</li>
+</ol>
+<!-- /wp:list -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code># The dossier, as one block
+Connect-MgGraph -Scopes "User.Read.All","RoleManagement.Read.Directory","Application.Read.All"
+
+# 1. Find every account before profiling any of them.
+#    Search the surname, not the UPN, and show the sync flag.
+Get-MgUser -Search 'displayName:Doe' -ConsistencyLevel eventual -All `
+    -Property Id,UserPrincipalName,DisplayName,AccountEnabled,OnPremisesSyncEnabled |
+    Select-Object UserPrincipalName,DisplayName,AccountEnabled,OnPremisesSyncEnabled
+
+# 2. Then profile each account you found.
+foreach ($upn in @("adm-jdoe@contoso.onmicrosoft.com","jdoe@contoso.com")) {
+    $u = Get-MgUser -UserId $upn
+    Write-Host "=== $upn ==="
+    Get-MgRoleManagementDirectoryRoleAssignment -Filter "principalId eq '$($u.Id)'" -All  # active roles
+    Get-MgUserRegisteredDevice -UserId $u.Id -All                                         # devices
+    Get-MgUserOwnedObject -UserId $u.Id -All                                              # owned groups + apps
+}</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Export it all into a dossier document and date it. Then decide the two disposition questions now, in the calm: whether the mailbox becomes a shared mailbox or an inactive one, and whether each device is coming back or being wiped in the field. Making those calls mid-termination produces bad answers.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">The second account, and why it survives a careful termination</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Any admin working to Microsoft's own guidance has at least two accounts. The daily driver holds the mailbox, the Teams presence, the laptop, and no privilege worth the name. The admin account holds the roles, and Microsoft's position is that privileged accounts should be cloud-only, with no tie to on-premises Active Directory, not shared between people, and not mail-enabled. Every one of those properties is good security, and every one of them is a reason the admin account walks straight through a termination written around the person's ordinary user object.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Work through why. It is cloud-only, so disabling and resetting the on-prem account does nothing to it, and no sync cycle will carry the change. It is unlicensed, so it is invisible in the Microsoft 365 admin center views that most offboarding checklists were written against. It has no mailbox, so the mailbox step never touches it and nobody notices it is missing. It is likely excluded from the Conditional Access policies that constrain everyone else, because carving out admin accounts is the oldest workaround in the tenant. It probably carries the PIM eligibility. And its UPN is frequently on the tenant's <code>.onmicrosoft.com</code> routing domain rather than the company domain, so a search that assumes <code>@contoso.com</code> returns nothing at all.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:pullquote -->
+<figure class="wp-block-pullquote"><blockquote><p>The account you built to be separate from everything is separate from your offboarding too.</p></blockquote></figure>
+<!-- /wp:pullquote -->
+
+<!-- wp:paragraph -->
+<p>So the run book runs twice, and the order inverts the intuition: the admin account is cut <em>first</em>, because it is the one that can undo your work. Someone who still holds User Administrator can re-enable the account you just disabled. The daily driver is the account with the mailbox and the sentiment attached to it; the admin account is the one with the tenant attached to it.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:table -->
+<figure class="wp-block-table"><table><thead><tr><th>Account type</th><th>How you find it</th><th>What it needs</th></tr></thead><tbody><tr><td>Daily driver, synced from AD</td><td>Obvious; it is the one with the mailbox</td><td>The whole run book, steps 2 through 7</td></tr><tr><td>Admin account, cloud-only</td><td>Surname search plus your <code>adm-</code> convention; filter for on-premises sync disabled; check the <code>.onmicrosoft.com</code> domain</td><td>Steps 2, 5, and 6. No mailbox work. Cut first, and never delete it.</td></tr><tr><td>On-prem-only admin account</td><td>Active Directory Users and Computers, not Entra; it may never have synced</td><td>Disable and double reset on-prem; remove from privileged groups</td></tr><tr><td>Shared admin account, several people know it</td><td>You already know; it is the estate's worst-kept secret</td><td>Rotate, do not disable. Treat it as break-glass class in step 5.</td></tr><tr><td>Service or test accounts they created</td><td>Owned-objects list, plus accounts with no manager and no sign-in history</td><td>Judgment. Disable and watch what breaks, rather than deleting.</td></tr></tbody></table></figure>
+<!-- /wp:table -->
+
+<!-- wp:paragraph -->
+<p>The last row is the one that generates argument, so take a position: disable, wait, and let the breakage identify the dependency. A test account nobody can account for is not evidence of innocence, and an account that turns out to run a production job announces itself within a day of being disabled, which is a cheaper way to find out than the alternatives.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p><strong>Disable the admin account. Do not delete it, and do not let anyone delete it in six months either.</strong> A long-tenured admin's privileged account accumulates sole ownership of things nobody thinks to check: the only Owner on an Azure subscription or a management group, the sole owner of an app registration or enterprise application, the named technical or billing contact on a subscription, the only administrator on a SaaS tenant that sits outside your SSO, the account a vendor portal recognises. Disabling breaks none of that. Deleting orphans all of it, and it does so silently, surfacing months later as a resource nobody can manage and a support case nobody wants.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Entra soft-deletes a user for 30 days, so an accidental deletion inside that window is recoverable and a deletion outside it is not. Orphaned Azure ownership has a documented recovery path (a Global Administrator can elevate access at root scope and reassign Owner), which is worth knowing precisely because it is the kind of thing you find out you need at the wrong moment. Third-party SaaS and vendor portals frequently have no equivalent path at all, and that is where deletion turns into a procurement conversation. So the disposition for the admin account is the same shape as the shared-mailbox anchor, arrived at from the opposite direction: it stays, disabled, unlicensed, stripped of roles, marked, indefinitely. Reassign the ownerships at your leisure, then keep the empty account anyway.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">Step 2: The first fifteen minutes, cutting identity</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>This step runs while the termination conversation is happening, executed by the second privileged person. The order is deliberate: disable first, then revoke. Revoking sessions on an account that is still enabled achieves little, because the client signs back in and mints fresh tokens. Disable closes the front door; revocation invalidates what is already in their pocket. If you are hybrid, start on-prem, and do not wait for sync to carry the disable to the cloud. Do both directly. Run the whole sequence against the admin account first, then against the daily driver, for the reason the previous section gives.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul class="wp-block-list">
+<li>☐ Admin account disabled and sessions revoked, first</li>
+<li>☐ Admin account active role assignments removed</li>
+<li>☐ Admin account eligible PIM assignments removed</li>
+<li>☐ Admin account Azure RBAC assignments removed (separate surface from Entra roles)</li>
+<li>☐ AD account disabled (hybrid)</li>
+<li>☐ AD password reset twice, random values (hybrid)</li>
+<li>☐ Entra daily-driver account disabled</li>
+<li>☐ Sessions revoked on the daily driver</li>
+<li>☐ Every device object disabled</li>
+<li>☐ Any remaining role assignments removed, both kinds, both accounts</li>
+<li>☐ Last-GA guard handled through break-glass, if it applies</li>
+<li>☐ Any shared admin account rotated rather than disabled</li>
+<li>☐ Nothing deleted: the admin account is disabled and kept, sole ownerships intact</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p><strong>The walk-through.</strong></p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list {"ordered":true} -->
+<ol class="wp-block-list">
+<li><strong>The admin account, before anything else.</strong> Run items 2, 3, 5 and 6 of this list against it now. It is cloud-only, so it has no on-prem half and no mailbox, which makes it the fastest account in this run book to cut and the most expensive one to leave running.</li>
+<li><strong>Hybrid only, on-prem first.</strong> In Active Directory Users and Computers, right-click the user and select <strong>Disable Account</strong>. Then right-click again, select <strong>Reset Password</strong>, and set a long random password. Do the reset twice, with two different random values; the double reset mitigates pass-the-hash against the old credential.</li>
+<li><strong>Disable in Entra.</strong> In the Microsoft Entra admin center, open <strong>Entra ID</strong>, <strong>Users</strong>, select the user, and under <strong>Account status</strong> select <strong>Edit</strong>. Clear <strong>Account enabled</strong> and save.</li>
+<li><strong>Revoke sessions.</strong> On the same user's <strong>Overview</strong> page, select <strong>Revoke sessions</strong>. This invalidates their refresh tokens and browser session cookies; expect a delay of a few minutes before it fully lands.</li>
+<li><strong>Disable their devices.</strong> In <strong>Entra ID</strong>, open <strong>Devices</strong>, <strong>All devices</strong>, select each device from the dossier, and select <strong>Disable</strong>. A disabled device object cannot use its Primary Refresh Token to authenticate.</li>
+<li><strong>Remove active roles.</strong> In <strong>Entra ID</strong>, open <strong>Roles &amp; admins</strong>, select each role from the dossier, tick the user, and select <strong>Remove assignment</strong>. In a PIM tenant the same removal lives in PIM: <strong>ID Governance</strong>, <strong>Privileged Identity Management</strong>, <strong>Microsoft Entra roles</strong>, <strong>Roles</strong>, select the role, find the user on the <strong>Active roles</strong> tab, and select <strong>Remove</strong>.</li>
+<li><strong>Remove eligible roles.</strong> Same PIM surface, <strong>Eligible roles</strong> tab, <strong>Remove</strong>. An eligible assignment survives everything else in this run book and reactivates with one approval, which is why it gets its own numbered step instead of a footnote.</li>
+<li><strong>Remove Azure RBAC, which is a different system.</strong> Entra directory roles and Azure resource roles are separate surfaces, and clearing one tells you nothing about the other. In the Azure portal, check <strong>Access control (IAM)</strong>, <strong>Role assignments</strong>, at management group, subscription, and resource group scope, and in PIM check <strong>Azure resources</strong> for eligible assignments there too. Owner or Contributor on a subscription outlives every step above it in this list.</li>
+</ol>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p>One guard to know about before step 5 surprises you: Entra will refuse to remove the last active Global Administrator assignment, which is precisely why the break-glass account exists. If the leaver is your last standing GA, the break-glass account takes an active assignment first, then the leaver's comes off.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code># The identity cut, as one block
+# On-prem (hybrid): disable, then reset the password twice
+Disable-ADAccount -Identity jdoe
+Set-ADAccountPassword -Identity jdoe -Reset -NewPassword (Read-Host -AsSecureString)
+Set-ADAccountPassword -Identity jdoe -Reset -NewPassword (Read-Host -AsSecureString)
+
+# Entra: disable, revoke, block devices, strip active roles.
+# Admin account FIRST, then the daily driver.
+Connect-MgGraph -Scopes "User.ReadWrite.All","Directory.AccessAsUser.All"
+
+$accounts = @(
+    "adm-jdoe@contoso.onmicrosoft.com",   # privileged, cloud-only
+    "jdoe@contoso.com"                    # daily driver, synced
+)
+
+foreach ($upn in $accounts) {
+    $u = Get-MgUser -UserId $upn
+
+    Update-MgUser -UserId $u.Id -AccountEnabled:$false
+    Revoke-MgUserSignInSession -UserId $u.Id
+
+    Get-MgUserRegisteredDevice -UserId $u.Id -All | ForEach-Object {
+        Update-MgDevice -DeviceId $_.Id -AccountEnabled:$false
+    }
+
+    Get-MgRoleManagementDirectoryRoleAssignment -Filter "principalId eq '$($u.Id)'" -All |
+        ForEach-Object {
+            Remove-MgRoleManagementDirectoryRoleAssignment -UnifiedRoleAssignmentId $_.Id
+        }
+}
+# Eligible PIM assignments: remove in the PIM portal, or via the Graph
+# roleEligibilityScheduleRequests API with the adminRemove action.
+# Azure RBAC is a separate surface: check Access control (IAM) per scope.</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Now the part the run book cannot compress: the clock. Disabling the account stops new tokens immediately, and for CAE-capable workloads (Outlook, Teams, SharePoint and OneDrive on modern clients) the disable is enforced in near real time. Everything else rides out the access token it already holds, and the default access token lifetime is one hour. Third-party SaaS applications that issued their own session cookie after an Entra sign-in keep their session until the app reevaluates it, which is governed by the app, not by you. Deprovision those apps directly where they matter.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:pullquote -->
+<figure class="wp-block-pullquote"><blockquote><p>The account dies in seconds. The tokens die on their own schedule. Plan the meeting around the tokens.</p></blockquote></figure>
+<!-- /wp:pullquote -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">Step 3: Devices, block first, reclaim second</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>The device disable in step 2 already did the urgent half. What remains is disposition, and the right action depends on whose device it is and where it is.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul class="wp-block-list">
+<li>☐ BitLocker recovery keys captured before any retire or delete</li>
+<li>☐ LAPS passwords captured before any retire or delete</li>
+<li>☐ Corporate devices wiped, returning or not</li>
+<li>☐ BYOD enrollments retired</li>
+<li>☐ MAM-only phones selective-wiped</li>
+<li>☐ Device records left in place until every action reports complete</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:table -->
+<figure class="wp-block-table"><table><thead><tr><th>Device situation</th><th>Action</th><th>Why</th></tr></thead><tbody><tr><td>Corporate Windows or Mac, being returned</td><td>Wipe, then reprovision</td><td>Factory reset removes their profile, cached credentials, and anything they staged. Autopilot or ADE rebuilds it for the next user.</td></tr><tr><td>Corporate device, not coming back</td><td>Wipe anyway, immediately</td><td>The wipe fires on next check-in. If the device stays offline it keeps its local data, so treat anything on an unreturned offline device as disclosed and rotate accordingly.</td></tr><tr><td>Personal device, MDM-enrolled (BYOD)</td><td>Retire</td><td>Removes company apps, profiles, certificates and mail, leaves their personal data alone. Certificates delivered by Intune are removed and revoked.</td></tr><tr><td>Personal phone, MAM-only</td><td>Selective wipe of managed apps</td><td>App protection data is removed at next app launch check-in. There is no device object to disable, which is the trade you accepted with MAM-only.</td></tr></tbody></table></figure>
+<!-- /wp:table -->
+
+<!-- wp:paragraph -->
+<p><strong>The walk-through.</strong></p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list {"ordered":true} -->
+<ol class="wp-block-list">
+<li><strong>Capture the escrow first.</strong> In the Microsoft Intune admin center, open <strong>Devices</strong>, <strong>All devices</strong>, and select the device. Record the BitLocker key from the device's <strong>Recovery keys</strong> node and the local admin password from its <strong>Local admin password</strong> node. Retiring or deleting the Intune object for an Entra-joined device triggers removal of the BitLocker key protectors and suspends BitLocker as a safeguard, and once the records are gone they are gone.</li>
+<li><strong>Wipe the corporate devices.</strong> On the same device page, select <strong>Wipe</strong> from the actions along the top and confirm. The action fires at next check-in; the device page's activity feed shows when it reports complete.</li>
+<li><strong>Retire the BYOD enrollments.</strong> Same page, <strong>Retire</strong>. Company data, profiles and certificates come off; personal data stays.</li>
+<li><strong>Selective-wipe the MAM-only phone.</strong> In <strong>Apps</strong>, open <strong>App selective wipe</strong>, create a wipe request targeting the user, and the protected app data is removed the next time each managed app checks in.</li>
+<li><strong>Leave the records alone until the actions report complete.</strong> Delete removes the management relationship and the audit trail; it does not make a missed wipe happen. Clean up device objects at the 30-day mark, not today.</li>
+</ol>
+<!-- /wp:list -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">Step 4: The mailbox and the data</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>This step runs after sign-in is blocked, never before, and it opens with a branch you decided back in step 1. If there is any realistic prospect of litigation or a compliance obligation around this departure, the mailbox's job is preservation: place a litigation hold (in the Exchange admin center, the mailbox's <strong>Others</strong> tab carries <strong>Manage litigation hold</strong>) and take the inactive-mailbox path rather than a shared mailbox. If the mailbox's job is continuity, the customers and vendors who mail this address still reaching a human, convert it to shared. You cannot make one mailbox do both jobs well.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul class="wp-block-list">
+<li>☐ Litigation branch decided; hold placed if preservation wins</li>
+<li>☐ Mailbox converted to shared</li>
+<li>☐ ActiveSync, IMAP, and POP blocked on the shared mailbox</li>
+<li>☐ Full Access granted to the successor</li>
+<li>☐ License removed after the conversion confirms</li>
+<li>☐ Anchor account kept, and marked against cleanup</li>
+<li>☐ OneDrive access granted to the manager</li>
+<li>☐ Owned groups, Teams, and distribution lists reassigned</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:table -->
+<figure class="wp-block-table"><table><thead><tr><th>Path</th><th>What it gives you</th><th>What it costs you</th></tr></thead><tbody><tr><td>Shared mailbox</td><td>The address stays alive, the team reads and sends from it, history is browsable, no license under 50 GB</td><td>Not a preservation mechanism; content is editable by anyone with access</td></tr><tr><td>Litigation hold, then inactive mailbox</td><td>Immutable preservation, searchable through eDiscovery</td><td>Receives nothing; the address goes dark; requires the hold license tier</td></tr></tbody></table></figure>
+<!-- /wp:table -->
+
+<!-- wp:paragraph -->
+<p><strong>The walk-through</strong>, for the continuity path:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list {"ordered":true} -->
+<ol class="wp-block-list">
+<li><strong>Convert.</strong> In the Microsoft 365 admin center, open <strong>Users</strong>, <strong>Active users</strong>, select the user, and on the <strong>Mail</strong> tab select <strong>Convert to shared mailbox</strong>, then <strong>Convert</strong>.</li>
+<li><strong>Block the client protocols.</strong> In the Exchange admin center, open <strong>Recipients</strong>, <strong>Mailboxes</strong>, select the mailbox, and under its email apps settings disable <strong>Mobile (Exchange ActiveSync)</strong>, <strong>IMAP</strong>, and <strong>POP3</strong>. A shared mailbox should never be a mailbox somebody's phone still syncs.</li>
+<li><strong>Grant the people taking over.</strong> On the same mailbox, open the <strong>Delegation</strong> settings and add the manager or team under <strong>Read and manage (Full Access)</strong>. The mailbox auto-maps into their Outlook.</li>
+<li><strong>Remove the license.</strong> Back in the Microsoft 365 admin center, once the user's Mail tab confirms the mailbox is shared and it is under 50 GB, remove the license on the <strong>Licenses and apps</strong> tab.</li>
+<li><strong>Do not delete the account.</strong> The shared mailbox needs the account object as its anchor, disabled and unlicensed, forever. Deleting the anchor account is the single most common way this entire run book gets quietly undone months later, usually by someone tidying up stale users. Mark it so your future self recognizes it: a display-name prefix such as <code>ZZ-Shared-</code>, or an exclusion group your cleanup scripts respect, whichever convention your estate already uses.</li>
+<li><strong>Hand over the OneDrive.</strong> In the Microsoft 365 admin center, on the user's <strong>OneDrive</strong> tab, use <strong>Create link to files</strong> to grant the manager access now, while everyone remembers. Content survives 30 days after any future account deletion by default, and the safe assumption is that nobody will remember in time.</li>
+<li><strong>Reassign what they owned.</strong> Groups, Teams, and distribution lists from the dossier's ownership list each get a new owner. This is what the ownership enumeration in step 1 was for.</li>
+</ol>
+<!-- /wp:list -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code># The mailbox moves, as one block
+Connect-ExchangeOnline
+
+Set-Mailbox -Identity "jdoe@contoso.com" -Type Shared
+Set-CASMailbox -Identity "jdoe@contoso.com" -ActiveSyncEnabled $false -ImapEnabled $false -PopEnabled $false
+Add-MailboxPermission -Identity "jdoe@contoso.com" -User "manager@contoso.com" -AccessRights FullAccess -AutoMapping $true
+
+Get-Mailbox -Identity "jdoe@contoso.com" | Select-Object RecipientTypeDetails
+# expect: SharedMailbox, before you touch the license</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">Step 5: The privileged residue, rotating what they knew</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Everything above would be the same run book for a departing accountant. This section is why the IT termination is its own scenario. A privileged employee's real access inventory is the set of credentials they have seen, and no directory query returns it. You rotate from an assumption of knowledge, in order of blast radius.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul class="wp-block-list">
+<li>☐ Break-glass rotated, tested, resealed (today)</li>
+<li>☐ Any shared admin account the team uses in common rotated (today)</li>
+<li>☐ Registrar, DNS, certificate authority, and federation accounts rotated (today)</li>
+<li>☐ Backup console and deletion protections rotated (today)</li>
+<li>☐ Hypervisor root rotated (today)</li>
+<li>☐ Infrastructure passwords rotated (this week, tracked in the dossier)</li>
+<li>☐ App registration owners reassigned, every client secret rotated</li>
+<li>☐ Sole ownerships found and reassigned: Azure subscriptions and management groups, enterprise apps, subscription technical and billing contacts, non-SSO SaaS tenants, vendor portals</li>
+<li>☐ Service accounts and embedded secrets enumerated, then rotated</li>
+<li>☐ Authentication methods, FIDO2 keys, and any TAP removed from every account they held</li>
+<li>☐ Disabled account pulled from Domain Admins and every privileged group</li>
+<li>☐ Services and scheduled tasks running as their account checked</li>
+<li>☐ Recently read LAPS passwords rotated</li>
+<li>☐ Vendor and partner portal accounts removed or rotated</li>
+<li>☐ GDAP groups cleaned, per-customer pass scheduled (MSP)</li>
+<li>☐ Physical codes recoded, tokens collected and deregistered</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:table -->
+<figure class="wp-block-table"><table><thead><tr><th>Credential class</th><th>Examples</th><th>Move</th></tr></thead><tbody><tr><td>Break-glass accounts</td><td>The emergency Global Admin</td><td>If they ever knew it, it is burned. Rotate today, test the new credential works, reseal the store.</td></tr><tr><td>Identity-adjacent external</td><td>DNS registrar, domain registrar, certificate authority accounts, federation config</td><td>Rotate first among external accounts. Control of DNS is control of the tenant's front door.</td></tr><tr><td>Destruction-capable</td><td>Backup console, backup deletion PIN, immutability settings, hypervisor root</td><td>Rotate the same day. This class is what turns a bad departure into an unrecoverable one.</td></tr><tr><td>Infrastructure admin</td><td>Firewall, switches, Wi-Fi controllers, NAS, iDRAC and iLO, UPS</td><td>Rotate this week, tracked as a checklist in the dossier.</td></tr><tr><td>Service accounts and secrets</td><td>App registration client secrets, API keys, scripts with embedded credentials, scheduled task identities</td><td>Enumerate first, then rotate deliberately. Rotating blind breaks production; not rotating leaves a standing credential in a departed person's head.</td></tr><tr><td>Vendor and partner portals</td><td>Microsoft partner and licensing portals, ISP, telco, SaaS admin consoles outside SSO</td><td>Remove their named accounts; rotate anything shared.</td></tr><tr><td>Physical</td><td>Door codes, alarm codes, server room keys, hardware tokens</td><td>Collect, recode, and deregister returned FIDO2 keys from the account's authentication methods.</td></tr></tbody></table></figure>
+<!-- /wp:table -->
+
+<!-- wp:paragraph -->
+<p><strong>The walk-through.</strong> The tenant-side rotations each have a home in the portals. App registrations they owned: in the Microsoft Entra admin center, open <strong>Entra ID</strong>, <strong>App registrations</strong>, select each app from the dossier's ownership list, add a new owner under <strong>Owners</strong>, then open <strong>Certificates &amp; secrets</strong> and rotate every client secret, because a secret is knowable by whoever created it, and a valid secret does not care that its creator's user account is disabled. Their authentication methods: on the user, open <strong>Authentication methods</strong> and remove the registered authenticators, FIDO2 keys, and any Temporary Access Pass, because a disabled account gets re-enabled someday by someone who does not know this history, and it should come back clean.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>On-prem: in Active Directory Users and Computers, pull the disabled account out of Domain Admins and its cousins anyway, since a disabled account in Domain Admins is one re-enable away from domain control. While you are in the neighborhood, check for services and scheduled tasks running as their personal account, and rotate any LAPS passwords they read recently: in Intune the device action is <strong>Rotate local admin password</strong> on the device page, and on-prem AD supports on-demand rotation per machine.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>If you are an MSP or the leaver worked customer tenants through GDAP, this whole section forks per customer: in Partner Center, remove them from the security groups that carry the GDAP role assignments, then run the credential-class table again for anything they knew inside each customer estate. That work is measured in days, and it belongs on a schedule with an owner, not on a someday list.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">A worked example: the 2 pm walkout</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Your infrastructure engineer of six years is being terminated for cause, effective at a 2:00 meeting today. At 1:15 you build the dossier, and the surname search returns two accounts: <code>jdoe@contoso.com</code>, synced and mailboxed, and <code>adm-jdoe@contoso.onmicrosoft.com</code>, cloud-only and unlicensed, which is where all four active roles and the eligible Global Administrator actually live. Between them: three registered devices, eleven owned objects including two app registrations with live secrets, and, found on the admin account, sole Owner on the subscription that runs the backup vault. At 1:50 you sign in with your own account, open both users in Entra, and stage the tabs you will need. At 2:01, as the meeting starts, you make the cut, admin account first: <strong>Account enabled</strong> cleared, <strong>Revoke sessions</strong>, four role assignments removed, the eligible GA removed in PIM, subscription Owner reassigned to you. Then the daily driver: AD disable and double reset, <strong>Account enabled</strong> cleared, <strong>Revoke sessions</strong>, three devices disabled. At 2:10 the <strong>Wipe</strong> is issued to the laptop sitting in the meeting room and the <strong>Retire</strong> to the BYOD phone. At 2:40, meeting over, the mailbox converts to shared and the manager gets Full Access. Between 3:00 and 5:00 the same-day rotation class happens: break-glass, registrar, backup console, hypervisor. The infrastructure and service-account rotations are scheduled across the next four working days, each line in the dossier getting an owner and a date. Both accounts stay in the tenant, disabled and marked, and the dossier says in one sentence why. The first fifteen minutes were staged in open tabs. The residue was scheduled. Nothing was left to memory.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">Step 6: Validation, proving the cut</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Validate resolved state, not behavior. "They could not log in when we tried" proves nothing, because the interesting failure modes are tokens and side doors, and a login test exercises neither.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul class="wp-block-list">
+<li>☐ Every account found in step 1 shows disabled, admin account included</li>
+<li>☐ Role assignments zero per account, active and eligible both</li>
+<li>☐ Azure RBAC assignments zero at every scope</li>
+<li>☐ Every device object disabled</li>
+<li>☐ Mailbox type SharedMailbox, license removed</li>
+<li>☐ Sign-in logs watched for 24 hours, per account, non-interactive included</li>
+<li>☐ PIM eligible list empty, per account</li>
+<li>☐ Retained accounts still present and still disabled (you did not over-delete)</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p><strong>The walk-through.</strong> In the portals, the resolved state reads like this: the user's profile shows <strong>Account status</strong> disabled and the <strong>Assigned roles</strong> page is empty on both tabs; every device on the user's <strong>Devices</strong> list shows disabled; the user's <strong>Mail</strong> tab in the Microsoft 365 admin center reports a shared mailbox and no license. The same asserts, scripted:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>foreach ($upn in @("adm-jdoe@contoso.onmicrosoft.com","jdoe@contoso.com")) {
+    $u = Get-MgUser -UserId $upn -Property Id,AccountEnabled
+    "$upn enabled: $($u.AccountEnabled)"
+    # expect: False
+
+    "$upn roles: $((Get-MgRoleManagementDirectoryRoleAssignment `
+        -Filter "principalId eq '$($u.Id)'" -All).Count)"
+    # expect: 0
+
+    Get-MgUserRegisteredDevice -UserId $u.Id -All |
+        ForEach-Object { Get-MgDevice -DeviceId $_.Id -Property AccountEnabled } |
+        Select-Object AccountEnabled
+    # expect: False on every row
+}
+# Both accounts must still RESOLVE. A "user not found" here means
+# someone deleted an account this run book says to keep.
+
+Get-Mailbox -Identity "jdoe@contoso.com" | Select-Object RecipientTypeDetails
+# expect: SharedMailbox</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Then the behavioral tail. In the Microsoft Entra admin center, open <strong>Entra ID</strong>, <strong>Monitoring &amp; health</strong>, <strong>Sign-in logs</strong>, filter to the user, and watch for the next 24 hours. Read the <strong>User sign-ins (non-interactive)</strong> tab as carefully as the interactive one, because surviving tokens show up there. The expected picture is interactive attempts failing with an account-disabled error and zero successes anywhere. A success after the cut means a surface you missed, and the log entry tells you which one. Last, confirm in PIM that the user's <strong>Eligible assignments</strong> list is empty; an eligible role survives everything else in this run book and reactivates with one approval.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:separator {"className":"is-style-wide"} -->
+<hr class="wp-block-separator has-alpha-channel-opacity is-style-wide"/>
+<!-- /wp:separator -->
+
+<!-- wp:heading -->
+<h2 class="wp-block-heading">Step 7: The tail, 24 hours and 30 days</h2>
+<!-- /wp:heading -->
+
+<!-- wp:list -->
+<ul class="wp-block-list">
+<li>☐ 24 h: wipes reported complete, overnight breakage triaged as discovery</li>
+<li>☐ 30 d: license reclaimed, device records cleaned up</li>
+<li>☐ 30 d: rotation checklist closed, every line owned and dated</li>
+<li>☐ 30 d: account decision made deliberately; a shared-mailbox anchor stays, and the admin account stays regardless</li>
+<li>☐ 30 d: both retained accounts marked so a future cleanup does not undo this</li>
+<li>☐ Dossier filed with the change record, ticket closed</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p>At 24 hours: review the sign-in logs, confirm the wipes reported complete on each device's page, and triage anything that broke overnight. Treat every overnight failure as discovery rather than nuisance, because a script that failed at 3 am is how you find the service account you missed, and finding it this way is the good outcome.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>At 30 days: reclaim the license if you have not already, clean up the wiped devices' Intune and Entra records, close out the rotation checklist with every line owned and dated, and make the account decision deliberately. If the mailbox went shared, the daily-driver account stays, disabled, unlicensed, and marked, indefinitely, because it anchors the mailbox. If it went the inactive-mailbox route, deleting the daily driver completes that design. The admin account stays either way, for the ownership reasons above, so the end state of a clean termination is usually one or two retained accounts that are disabled, empty of roles, and deliberately marked as not-stale. Write that in the dossier in plain words, because the person who eventually questions those accounts will not be you, and the dossier is the only thing that will answer them. File it with the change record and close the ticket. The run book ends when the dossier does.</p>
+<!-- /wp:paragraph -->

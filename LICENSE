@@ -1,3 +1,11 @@
+This repository carries two licences.
+
+PROSE (runbooks/, docs/, and README files): Creative Commons Attribution 4.0
+International (CC BY 4.0). https://creativecommons.org/licenses/by/4.0/
+Attribute to Virtual Caffeine IO.
+
+CODE (tools/, including scripts and tests): MIT License, below.
+
 MIT License
 
 Copyright (c) 2026 Virtual Caffeine IO

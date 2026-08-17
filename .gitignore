@@ -1,0 +1,9 @@
+# test harness output
+tools/**/test/out*/
+# run artifacts from live use
+termination-dossier/
+dossier-*.json
+onprem-*.ps1
+rollback-journal-*.json
+transcript-*.txt
+.DS_Store
